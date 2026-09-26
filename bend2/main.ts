@@ -35,7 +35,8 @@ const HELP = `Bend ${VERSION}: check, run, build and publish Bend programs.
 
 usage:
   bend <file.bend> [args]       check the file, then run main with args
-  bend <file.bend> -o <out>     build a binary; <out>.c emits C, <out>.js JS
+  bend <file.bend> -o <out>     build a binary; <out>.c emits C, <out>.js JS,
+                                <out>.wasm WebAssembly and its .mjs (emcc)
   bend <file.bend> --check-only check the file and its imports; run nothing
   bend <file.bend> --publish    publish the file and its imports to the hub
   bend <file.bend> --publish <name>@<version>
@@ -346,7 +347,11 @@ function cli_emit(book: Bend.Book, out: string): void {
     const c   = path.join(dir, path.basename(out) + ".c");
     fs.writeFileSync(c, Comp.compile_book(book));
     try {
-      cli_build(out, c);
+      if (out.endsWith(".wasm")) {
+        cli_build_wasm(out, c);
+      } else {
+        cli_build(out, c);
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -415,6 +420,23 @@ function cli_build(bin: string, file: string): void {
     if (child.spawnSync(cmd, args, { stdio: "inherit" }).status !== 0) {
       throw "Error: " + path.basename(cmd) + " failed to build " + bin;
     }
+  }
+}
+
+// cli_build_wasm builds the C file at `file` into the WebAssembly `wasm` and
+// the ES module beside it (.mjs) that runs it: emcc 3.1.35+ (tail calls),
+// a worker per thread, started as the runtime makes it, main on one of them
+// so the caller's thread stays free, 2 GiB of memory.
+function cli_build_wasm(wasm: string, file: string): void {
+  const emcc = process.env.EMCC || "emcc";
+  const args = ["-std=c11", "-O3", "-pthread", "-mtail-call", file, "-lm",
+    "-sPROXY_TO_PTHREAD", "-sINITIAL_MEMORY=2147483648", "-sSTACK_SIZE=8388608",
+    "-sDEFAULT_PTHREAD_STACK_SIZE=8388608", "-sEXIT_RUNTIME",
+    "-sENVIRONMENT=web,worker,node", "-sEXPORTED_RUNTIME_METHODS=FS",
+    "-o", path.resolve(wasm.slice(0, -".wasm".length) + ".mjs")];
+  if (child.spawnSync(emcc, args, { stdio: "inherit" }).status !== 0) {
+    throw "Error: " + emcc + " failed to build " + wasm
+      + " (a .wasm needs Emscripten 3.1.35+ on PATH, or at $EMCC)";
   }
 }
 
