@@ -34,12 +34,12 @@ const VERSION = "2.0.40";
 
 // BUILD tags a fork's bend after its version as semver build metadata:
 // "+win" prints bend <version>+win; upstream leaves it empty
-const BUILD = "";
+const BUILD = "+wasm";
 
 // the commands, one row each: [usage, what it does]; bend guide stays last
 const USAGE = [
   ["bend <file.bend> [args]", "check the file, then run main with args"],
-  ["bend <file.bend> -o <out>", "build a binary, or C, JS, .mjs or BendTT by extension"],
+  ["bend <file.bend> -o <out>", "build a binary, or C, JS, .mjs, .wasm or BendTT by extension"],
   ["bend <file.bend> --check-only", "check the file and its imports; run nothing"],
   ["bend <file.bend> --verdict", "check it, then recheck it with the proven kernel"],
   ["bend <file.bend> --publish [<name>@<version>]", "publish the file and its imports; a name needs login"],
@@ -322,10 +322,12 @@ async function cli_file(args: string[]): Promise<void> {
       t.$ === "Def" && t.i !== undefined ? t.i.map(path_real) : [])]);
     const outputs = new Map<string, string>();
     for (const out of outs) {
-      const binary = !/\.(mjs|c?js|c|bendtt)$/.test(out);
+      const binary = !/\.(mjs|c?js|c|bendtt|wasm)$/.test(out);
       const full = path.resolve(out);
       const at = path.join(path_real(path.dirname(full)), path.basename(full));
-      for (const key of binary ? [at, at + ".gpu"] : [at]) {
+      const companions = binary ? [at + ".gpu"] : out.endsWith(".wasm")
+        ? [at.slice(0, -".wasm".length) + ".mjs"] : [];
+      for (const key of [at, ...companions]) {
         const other = outputs.get(key);
         if (other !== undefined) {
           cli_fail("-o " + out + " conflicts with -o " + other);
@@ -427,7 +429,11 @@ function cli_emit(book: Bend.Book, out: string): void {
       const c = path.join(dir, path.basename(out) + ".c");
       fs.writeFileSync(c, Comp.compile_book(book));
       Bun.gc(true);
-      cli_build(out, c);
+      if (out.endsWith(".wasm")) {
+        cli_build_wasm(out, c);
+      } else {
+        cli_build(out, c);
+      }
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -517,6 +523,26 @@ function cli_build(bin: string, file: string): void {
       env: { ...process.env, BENDRTS: "" } }).status !== 0) {
       throw "Error: " + path.basename(cmd) + " failed to build " + bin;
     }
+  }
+}
+
+// cli_build_wasm builds the C file at `file` into the WebAssembly `wasm` and
+// the ES module beside it (.mjs) that runs it: emcc 3.1.35+ (tail calls),
+// a worker per thread, started as the runtime makes it, main on one of them
+// so the caller's thread stays free, 2 GiB of memory. Only the work loop's
+// musttail calls are tail calls: wasm32 passes an Env as a pointer to a copy
+// in the caller's frame, which a sibling call frees before the callee reads it.
+function cli_build_wasm(wasm: string, file: string): void {
+  const emcc = process.env.EMCC || "emcc";
+  const args = ["-std=c11", "-O3", "-pthread", "-mtail-call",
+    "-fno-optimize-sibling-calls", file, "-lm",
+    "-sPROXY_TO_PTHREAD", "-sINITIAL_MEMORY=2147483648", "-sSTACK_SIZE=8388608",
+    "-sDEFAULT_PTHREAD_STACK_SIZE=8388608", "-sEXIT_RUNTIME",
+    "-sENVIRONMENT=web,worker,node", "-sEXPORTED_RUNTIME_METHODS=FS",
+    "-o", path.resolve(wasm.slice(0, -".wasm".length) + ".mjs")];
+  if (child.spawnSync(emcc, args, { stdio: "inherit" }).status !== 0) {
+    throw "Error: " + emcc + " failed to build " + wasm
+      + " (a .wasm needs Emscripten 3.1.35+ on PATH, or at $EMCC)";
   }
 }
 

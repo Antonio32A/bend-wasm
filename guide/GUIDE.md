@@ -551,6 +551,7 @@ bend file.bend -o file.c  # emit the C source instead
 bend file.bend -o file.js # emit the JS source instead
 bend file.bend -o f.mjs   # emit an ES module of its non-IO defs, for JS to import
 bend file.bend --verdict  # check; then recheck with the proven BendTT kernel
+bend file.bend -o x.wasm  # compile to WebAssembly and its x.mjs (Emscripten)
 bend page.html -o dist    # bundle a web page that imports .bend files
 ./file +RTS --threads 8   # run a native binary on 8 CPU threads
 ./file +RTS --gpu 4GB     # cap the GPU heap at 4GB; off runs ! calls on the CPU
@@ -561,9 +562,14 @@ by the checker (slow for big work) and printed; a file with no `main` just
 checks. A binary that uses `!` builds its GPU program too, as `file.gpu`, which
 must stay beside it: on macOS it needs Metal, on Linux CUDA 12 or 13 at
 `$CUDA_HOME`, `/usr/local/cuda` or `/opt/cuda`. On Linux a program with a
-Window needs `libx11-dev`, one with Audio `libasound2-dev`. `bend guide` prints
-this text, `bend base` prints the Base library (`bend base Map` prints one name
-and everything under it), and `bend --help` lists the other commands.
+Window needs `libx11-dev`, one with Audio `libasound2-dev`. A `.wasm` (emcc
+3.1.35+) runs on every core, a worker per thread: `x.mjs` exports the
+Emscripten module factory, the page that loads it needs the
+`Cross-Origin-Opener-Policy: same-origin` and
+`Cross-Origin-Embedder-Policy: require-corp` headers, and a Window, Audio,
+sockets and processes are native only. `bend guide` prints this text, `bend
+base` prints the Base library (`bend base Map` prints one name and everything
+under it), and `bend --help` lists the other commands.
 
 ## Syntax Reference
 
