@@ -2916,9 +2916,9 @@ function compile_tables(fl: File, entries: Seg[]): string[] {
     `(V)[${j}] = ${r};`).join(" ")}`, "",
   `#define WL_TAKE(V) ${rs.slice(0, resw).map((r, j) =>
     `${r} = (V)[${j}];`).join(" ")}`, "",
-  `#define WL_SIG Env e, DEV Term* sp, u32 seq, u32 rn, ${ws.map((w) =>
-    "Term " + w).join(", ")}`, "", `#define WL_ALL e, sp, seq, rn, ${ws
-    .join(", ")}`, "",
+  `#define WL_SIG WL_ENV_SIG, DEV Term* sp, u32 seq, u32 rn, ${ws.map((w) =>
+    "Term " + w).join(", ")}`, "", `#define WL_ALL WL_ENV_ALL, sp, seq, rn, ${
+    ws.join(", ")}`, "",
   `#define WL_TABLE ${entries.map((s) => `WL_X(${s.fid})`).join(" ")}`
     + " WL_X(FID_EXIT)");
   return defs;
@@ -3480,7 +3480,15 @@ using namespace metal;
 #define UNLOCK(l)  __atomic_store_n(&(l), 0, __ATOMIC_RELEASE)
 #define WL_FN      static PRESERVE(preserve_none) __attribute__((noinline)) Term
 #define WL_CASE(F) WL_FN WL_##F(WL_SIG)
+#ifdef __wasm__
+#define WL_ENV_SIG DEV u64* e_mem, DEV u64* e_alc
+#define WL_ENV_ALL e.mem, e.alc
+#define WL_OPEN    { Env e = { e_mem, e_alc }; WL_BANK u32 rn;
+#else
+#define WL_ENV_SIG Env e
+#define WL_ENV_ALL e
 #define WL_OPEN    { WL_BANK u32 rn;
+#endif
 #define WL_JMP(F)  __attribute__((musttail)) return WL_##F(WL_ALL)
 #define WL_DYN(F)  __attribute__((musttail)) return wl_tab[F](WL_ALL)
 #endif
@@ -3800,7 +3808,11 @@ static const char* ERR_TEXT[] = { ${ERRS.map((s) => JSON.stringify(s))
 static void err_fail(const char* msg) {
   fflush(stdout);
   fprintf(stderr, "bend: %s\n", msg);
+#ifdef __EMSCRIPTEN__
+  exit(1); // _exit on a pthread ends only its own worker
+#else
   _exit(1);
+#endif
 }
 
 static void err_post(u64* H, u32 code) {
@@ -4782,10 +4794,26 @@ static void row_grow(Env e, DEV Term* stk, u32 base, u32 stride, u32 want) {
 
 // cpu_count caps the CPU count by the affinity mask and the cgroup quota.
 
+#define W32 (sizeof(void*) == 4)
+
+#ifdef __EMSCRIPTEN__
+static void* pool_try(void* at, u64 bytes) {
+  char* brk = sbrk(0);
+  char* p   = NULL;
+  if (posix_memalign((void**)&p, 16384, bytes) != 0) {
+    return MAP_FAILED;
+  }
+  if (p < brk) {
+    memset(p, 0, (u64)(brk - p) < bytes ? (u64)(brk - p) : bytes);
+  }
+  return p;
+}
+#else
 static void* pool_try(void* at, u64 bytes) {
   return mmap(at, bytes, PROT_READ | PROT_WRITE,
     MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
 }
+#endif
 
 static void* pool_mmap(u64 bytes) {
   void* p = pool_try(NULL, bytes);
@@ -4796,7 +4824,7 @@ static void* pool_mmap(u64 bytes) {
 }
 
 static Term* pool_stack(void) {
-  u64   len = 1ull << 31;
+  u64   len = 1ull << (W32 ? 24 : 31);
   char* p   = pool_mmap(len + 16384 + SIGSTKSZ);
   if (mprotect(p + len, 16384, PROT_NONE) != 0) {
     err_fail("stack guard failed");
@@ -5245,7 +5273,7 @@ static void cube_run(u64* H, bool gpu) {
 static u64 corpus_size;
 
 static void* corpus_map(u64 size) {
-  u64   hint = 1ull << 45;
+  u64   hint = W32 ? 0 : 1ull << 45;
   void* p    = pool_try((void*)hint, size);
   while (p != (void*)hint && hint > size) {
     if (p != MAP_FAILED) {
@@ -5284,7 +5312,7 @@ static bool corpus_grow(u64* H, u64 need) {
   while (ok && need > a32_load(a32_at(H, H_CAP))) {
     u64   more = corpus_size;
     char* at   = (char*)H + more;
-    void* got  = io_gpu || more >= 1ull << 43 ? MAP_FAILED
+    void* got  = io_gpu || W32 || more >= 1ull << 43 ? MAP_FAILED
       : pool_try(at, more);
     ok = got == at;
     if (ok) {
@@ -5300,7 +5328,7 @@ static bool corpus_grow(u64* H, u64 need) {
 static u64* corpus_setup(bool gpu, long threads, u64 bytes) {
   io_gpu     = gpu;
   KEEP_WORDS = gpu ? CHUNK : CAP_WORDS;
-  u64 dflt   = gpu ? gpu_span() : 1ull << 33;
+  u64 dflt   = gpu ? gpu_span() : 1ull << (W32 ? 30 : 33);
   u64 size   = (gpu && bytes != 0 ? bytes : dflt) & ~16383ull;
   CORPUS     = gpu ? gpu_map(size) : corpus_map(size);
   u64* H     = CORPUS;
@@ -5694,7 +5722,7 @@ static void io_wait(Env e) {
       top = (int)a->word;
     }
   }
-  u64 len = (u64)top / 64 * 8 + 8;
+  u64 len = (u64)(top < FD_SETSIZE ? FD_SETSIZE - 1 : top) / 64 * 8 + 8;
   u8* set[2] = { io_mem(calloc(2, len)), NULL };
   set[1] = set[0] + len;
   io_bit(set[0], io_wake_fd[0], true);

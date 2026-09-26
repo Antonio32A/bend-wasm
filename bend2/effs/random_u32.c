@@ -11,6 +11,8 @@ static void io_random_u32_call(IoWork* w) {
 #ifdef __APPLE__
   arc4random_buf(&w->word, sizeof(w->word));
   w->code = 0;
+#elif defined(__EMSCRIPTEN__)
+  io_sys_end(w, getentropy(&w->word, sizeof(w->word)));
 #else
   io_sys_end(w, getrandom(&w->word, sizeof(w->word), 0));
 #endif
