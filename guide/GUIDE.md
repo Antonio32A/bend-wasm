@@ -551,6 +551,7 @@ bend file.bend -o file.js # emit the JS source instead
 bend file.bend -o f.mjs   # emit an ES module of its non-IO defs, for JS to import
 bend file.bend --verdict  # check; then recheck with the proven BendTT kernel
 bend file.bend -o x.wasm  # compile to WebAssembly and its x.mjs (Emscripten)
+bend file.bend -o x.wasm --single-thread  # WebAssembly on one thread
 bend page.html -o dist    # bundle a web page that imports .bend files
 ./file --threads 8        # run a native binary on 8 CPU threads
 ./file --gpu off          # run ! calls on the CPU (the GPU is on by default)
@@ -566,7 +567,12 @@ with Audio `libasound2-dev`. A `.wasm` (emcc 3.1.35+) runs on every core, a
 worker per thread: `x.mjs` exports the Emscripten module factory, the page
 that loads it needs the `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp` headers, and a Window, Audio,
-sockets and processes are native only. `bend guide` prints this text, `bend
+sockets and processes are native only. With `--single-thread` it runs main on
+the caller's thread (no workers, no headers), its effects inline, in memory
+grown as it needs (a 1 GiB corpus, `EMCC_CFLAGS=-DBEND_CORPUS_MB=N` sizes
+it), for a host without threads such as a Cloudflare Worker, which
+passes its precompiled module through the factory's `instantiateWasm`; its
+`--threads` does nothing. `bend guide` prints this text, `bend
 base` prints the Base library (`bend base Map` prints one name and everything
 under it), and `bend --help` lists the other commands.
 
