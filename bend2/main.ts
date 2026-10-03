@@ -37,6 +37,9 @@ usage:
   bend <file.bend> [args]       check the file, then run main with args
   bend <file.bend> -o <out>     build a binary; <out>.c emits C, <out>.js JS,
                                 <out>.wasm WebAssembly and its .mjs (emcc)
+  bend <file.bend> -o <out>.wasm --single-thread
+                                WebAssembly on its caller's thread alone, its
+                                memory grown as it needs (no workers)
   bend <file.bend> --check-only check the file and its imports; run nothing
   bend <file.bend> --publish    publish the file and its imports to the hub
   bend <file.bend> --publish <name>@<version>
@@ -217,6 +220,7 @@ async function cli_file(args: string[]): Promise<void> {
   let checkup = false;
   let publish = false;
   let named: string | undefined;
+  let single = false;
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
     if (a === "--help" || a === "-h") {
@@ -232,6 +236,8 @@ async function cli_file(args: string[]): Promise<void> {
         named = args[i];
         named_parts(named);
       }
+    } else if (a === "--single-thread") {
+      single = true;
     } else if (a === "-o") {
       i += 1;
       outs.push(args[i] ?? cli_fail("-o needs an output file"));
@@ -264,6 +270,9 @@ async function cli_file(args: string[]): Promise<void> {
   if (argv.length !== 0 && (outs.length !== 0 || only || checkup || publish)) {
     cli_fail("arguments go to a run: bend <file.bend> [args]");
   }
+  if (single && (outs.length === 0 || outs.some((o) => !o.endsWith(".wasm")))) {
+    cli_fail("--single-thread builds a WebAssembly: -o <out>.wasm");
+  }
   if (checkup && outs.length !== 0) {
     cli_fail("--checkup takes no -o: a binary holds one main, so build each"
       + " import alone");
@@ -294,7 +303,7 @@ async function cli_file(args: string[]): Promise<void> {
       if (ins.has(at) || (fs.existsSync(at) && fs.statSync(at).isDirectory())) {
         cli_fail("-o " + out + " is a file the program reads, or a directory");
       }
-      cli_emit(book, out);
+      cli_emit(book, out, single);
     }
   } catch (e) {
     cli_say(2, book_err(e) + "\n");
@@ -337,7 +346,7 @@ function path_real(p: string): string {
   return fs.existsSync(p) ? fs.realpathSync(p) : path.resolve(p);
 }
 
-function cli_emit(book: Bend.Book, out: string): void {
+function cli_emit(book: Bend.Book, out: string, single: boolean): void {
   if (/\.c?js$/.test(out)) {
     fs.writeFileSync(out, Comp.js_book(book));
   } else if (out.endsWith(".c")) {
@@ -348,7 +357,7 @@ function cli_emit(book: Bend.Book, out: string): void {
     fs.writeFileSync(c, Comp.compile_book(book));
     try {
       if (out.endsWith(".wasm")) {
-        cli_build_wasm(out, c);
+        cli_build_wasm(out, c, single);
       } else {
         cli_build(out, c);
       }
@@ -426,14 +435,23 @@ function cli_build(bin: string, file: string): void {
 // cli_build_wasm builds the C file at `file` into the WebAssembly `wasm` and
 // the ES module beside it (.mjs) that runs it: emcc 3.1.35+ (tail calls),
 // a worker per thread, started as the runtime makes it, main on one of them
-// so the caller's thread stays free, 2 GiB of memory.
-function cli_build_wasm(wasm: string, file: string): void {
+// so the caller's thread stays free, 2 GiB of memory. A single-thread build
+// runs main on the caller's thread, in memory grown exactly as it needs, for
+// a web embedder without threads (a Cloudflare Worker); $EMCC_CFLAGS can size
+// its corpus (-DBEND_CORPUS_MB=N).
+function cli_build_wasm(wasm: string, file: string, single: boolean): void {
   const emcc = process.env.EMCC || "emcc";
-  const args = ["-std=c11", "-O3", "-pthread", "-mtail-call", file, "-lm",
-    "-sPROXY_TO_PTHREAD", "-sINITIAL_MEMORY=2147483648", "-sSTACK_SIZE=8388608",
-    "-sDEFAULT_PTHREAD_STACK_SIZE=8388608", "-sEXIT_RUNTIME",
-    "-sENVIRONMENT=web,worker,node", "-sEXPORTED_RUNTIME_METHODS=FS",
-    "-o", path.resolve(wasm.slice(0, -".wasm".length) + ".mjs")];
+  const args = single
+    ? ["-std=c11", "-O3", "-mtail-call", file, "-lm", "-sALLOW_MEMORY_GROWTH",
+      "-sMEMORY_GROWTH_GEOMETRIC_STEP=0", "-sINITIAL_HEAP=65536",
+      "-sSTACK_SIZE=1048576", "-sEXIT_RUNTIME", "-sENVIRONMENT=web",
+      "-sEXPORTED_RUNTIME_METHODS=FS"]
+    : ["-std=c11", "-O3", "-pthread", "-mtail-call", file, "-lm",
+      "-sPROXY_TO_PTHREAD", "-sINITIAL_MEMORY=2147483648",
+      "-sSTACK_SIZE=8388608", "-sDEFAULT_PTHREAD_STACK_SIZE=8388608",
+      "-sEXIT_RUNTIME", "-sENVIRONMENT=web,worker,node",
+      "-sEXPORTED_RUNTIME_METHODS=FS"];
+  args.push("-o", path.resolve(wasm.slice(0, -".wasm".length) + ".mjs"));
   if (child.spawnSync(emcc, args, { stdio: "inherit" }).status !== 0) {
     throw "Error: " + emcc + " failed to build " + wasm
       + " (a .wasm needs Emscripten 3.1.35+ on PATH, or at $EMCC)";

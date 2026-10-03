@@ -3468,6 +3468,15 @@ using namespace metal;
 #endif
 #define FAR static __attribute__((noinline))
 
+// A WebAssembly build without -pthread (SOLO) runs on its caller's thread
+// alone: one lane group of the smallest bag, its effects run inline.
+
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+#define SOLO 1
+#else
+#define SOLO 0
+#endif
+
 #if DEVICE
 #define LOCK(l)
 #define UNLOCK(l)
@@ -3588,7 +3597,13 @@ typedef u32 __attribute__((may_alias)) u32a;
 #define LINE      16
 #define PAGE_BITS 7
 #define PAGE_LEN  (1ull << PAGE_BITS)
+#if SOLO
+#define CUBE_T    16
+#define CUBE_CPU  4
+#else
 #define CUBE_T    128
+#define CUBE_CPU  7
+#endif
 #define CUBE      ((u64)CUBE_T * CUBE_T)
 #define CUBE_G    (1u << CUBE_LOG)
 #define LANES     ((u64)CUBE_T << CUBE_LOG)
@@ -3635,7 +3650,7 @@ typedef u32 __attribute__((may_alias)) u32a;
 static u64*    CORPUS;
 static u64    ALC[CUBE_T + 1][3 * NCLS_ALL] __attribute__((aligned(128)));
 static u32    KEEP_WORDS;
-static u32    CUBE_LOG = 7;
+static u32    CUBE_LOG = CUBE_CPU;
 static u32    bank_lock;
 
 static u32             pool_size;
@@ -5328,7 +5343,11 @@ static bool corpus_grow(u64* H, u64 need) {
 static u64* corpus_setup(bool gpu, long threads, u64 bytes) {
   io_gpu     = gpu;
   KEEP_WORDS = gpu ? CHUNK : CAP_WORDS;
+#ifdef BEND_CORPUS_MB
+  u64 dflt   = gpu ? gpu_span() : (u64)BEND_CORPUS_MB << 20;
+#else
   u64 dflt   = gpu ? gpu_span() : 1ull << (W32 ? 30 : 33);
+#endif
   u64 size   = (gpu && bytes != 0 ? bytes : dflt) & ~16383ull;
   CORPUS     = gpu ? gpu_map(size) : corpus_map(size);
   u64* H     = CORPUS;
@@ -5344,7 +5363,11 @@ static u64* corpus_setup(bool gpu, long threads, u64 bytes) {
   if (gpu) {
     gpu_load(size);
   }
+#if SOLO
+  pool_size = 1;
+#else
   pool_size = threads < 1 ? 1 : threads < CUBE_T ? threads : CUBE_T;
+#endif
   return H;
 }
 
@@ -5680,6 +5703,11 @@ static Term io_work(IoWork* w, IoCall call, IoPack pack) {
   w->call  = call;
   w->pack  = pack;
   io_busy += 1;
+#if SOLO
+  call(w);
+  while (write(io_wake_fd[1], &w, sizeof w) != sizeof w) {
+  }
+#else
   if (io_busy > io_size && io_size < IO_HELP) {
     pthread_t tid;
     if (pthread_create(&tid, NULL, io_help, NULL)) {
@@ -5692,6 +5720,7 @@ static Term io_work(IoWork* w, IoCall call, IoPack pack) {
   io_push(&io_jobs, w);
   pthread_cond_signal(&io_bell);
   pthread_mutex_unlock(&io_gate);
+#endif
   return IO_PARK;
 }
 
