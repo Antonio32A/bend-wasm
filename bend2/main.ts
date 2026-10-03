@@ -40,6 +40,7 @@ const BUILD = "+wasm";
 const USAGE = [
   ["bend <file.bend> [args]", "check the file, then run main with args"],
   ["bend <file.bend> -o <out>", "build a binary, or C, JS, .mjs, .wasm or BendTT by extension"],
+  ["bend <file.bend> -o <out>.wasm --single-thread", "WebAssembly on its caller's thread alone, no workers"],
   ["bend <file.bend> --check-only", "check the file and its imports; run nothing"],
   ["bend <file.bend> --verdict", "check it, then recheck it with the proven kernel"],
   ["bend <file.bend> --publish [<name>@<version>]", "publish the file and its imports; a name needs login"],
@@ -246,6 +247,7 @@ async function cli_file(args: string[]): Promise<void> {
   let checkup = false;
   let publish = false;
   let named: string | undefined;
+  let single = false;
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
     if (a === "--help" || a === "-h") {
@@ -263,6 +265,8 @@ async function cli_file(args: string[]): Promise<void> {
         named = args[i];
         named_parts(named);
       }
+    } else if (a === "--single-thread") {
+      single = true;
     } else if (a === "-o") {
       i += 1;
       outs.push(args[i] ?? cli_fail("-o needs an output file"));
@@ -293,6 +297,9 @@ async function cli_file(args: string[]): Promise<void> {
   // args go to a plain run only: any option (all start with -) refuses them
   if (argv.length !== 0 && args.some((a) => a.startsWith("-") && a !== "--")) {
     cli_fail("arguments go to a run: bend <file.bend> [args]");
+  }
+  if (single && (outs.length === 0 || outs.some((o) => !o.endsWith(".wasm")))) {
+    cli_fail("--single-thread builds a WebAssembly: -o <out>.wasm");
   }
   if (checkup && outs.length !== 0) {
     cli_fail("--checkup takes no -o: a binary holds one main, so build each"
@@ -344,7 +351,7 @@ async function cli_file(args: string[]): Promise<void> {
       }
     }
     for (const out of outs) {
-      cli_emit(book, out);
+      cli_emit(book, out, single);
     }
   } catch (e) {
     cli_say(2, book_err(e) + "\n");
@@ -411,7 +418,7 @@ function output_conflicts(out: string, ins: Set<string>): boolean {
     || [...ins].some((input) => same_file(at, input))));
 }
 
-function cli_emit(book: Bend.Book, out: string): void {
+function cli_emit(book: Bend.Book, out: string, single: boolean): void {
   if (out.endsWith(".mjs")) {
     fs.writeFileSync(out, Comp.js_lib(book, true));
   } else if (/\.c?js$/.test(out)) {
@@ -430,7 +437,7 @@ function cli_emit(book: Bend.Book, out: string): void {
       fs.writeFileSync(c, Comp.compile_book(book));
       Bun.gc(true);
       if (out.endsWith(".wasm")) {
-        cli_build_wasm(out, c);
+        cli_build_wasm(out, c, single);
       } else {
         cli_build(out, c);
       }
@@ -529,16 +536,22 @@ function cli_build(bin: string, file: string): void {
 // cli_build_wasm builds the C file at `file` into the WebAssembly `wasm` and
 // the ES module beside it (.mjs) that runs it: emcc 3.1.35+ (tail calls),
 // a worker per thread, started as the runtime makes it, main on one of them
-// so the caller's thread stays free, 2 GiB of memory. Only the work loop's
-// musttail calls are tail calls: wasm32 passes an Env as a pointer to a copy
-// in the caller's frame, which a sibling call frees before the callee reads it.
-function cli_build_wasm(wasm: string, file: string): void {
+// so the caller's thread stays free, 2 GiB of memory. A single-thread build
+// runs main on the caller's thread, in memory grown exactly as it needs, for
+// a web embedder without threads (a Cloudflare Worker); $EMCC_CFLAGS can size
+// its corpus (-DBEND_CORPUS_MB=N). Only the work loop's musttail calls are
+// tail calls: wasm32 passes an Env as a pointer to a copy in the caller's
+// frame, which a sibling call frees before the callee reads it.
+function cli_build_wasm(wasm: string, file: string, single: boolean): void {
   const emcc = process.env.EMCC || "emcc";
-  const args = ["-std=c11", "-O3", "-pthread", "-mtail-call",
-    "-fno-optimize-sibling-calls", file, "-lm",
-    "-sPROXY_TO_PTHREAD", "-sINITIAL_MEMORY=2147483648", "-sSTACK_SIZE=8388608",
-    "-sDEFAULT_PTHREAD_STACK_SIZE=8388608", "-sEXIT_RUNTIME",
-    "-sENVIRONMENT=web,worker,node", "-sEXPORTED_RUNTIME_METHODS=FS",
+  const args = ["-std=c11", "-O3", "-mtail-call", "-fno-optimize-sibling-calls",
+    file, "-lm", "-sEXIT_RUNTIME", "-sEXPORTED_RUNTIME_METHODS=FS",
+    ...single
+      ? ["-sALLOW_MEMORY_GROWTH", "-sMEMORY_GROWTH_GEOMETRIC_STEP=0",
+        "-sINITIAL_HEAP=65536", "-sSTACK_SIZE=1048576", "-sENVIRONMENT=web"]
+      : ["-pthread", "-sPROXY_TO_PTHREAD", "-sINITIAL_MEMORY=2147483648",
+        "-sSTACK_SIZE=8388608", "-sDEFAULT_PTHREAD_STACK_SIZE=8388608",
+        "-sENVIRONMENT=web,worker,node"],
     "-o", path.resolve(wasm.slice(0, -".wasm".length) + ".mjs")];
   if (child.spawnSync(emcc, args, { stdio: "inherit" }).status !== 0) {
     throw "Error: " + emcc + " failed to build " + wasm
