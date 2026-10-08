@@ -5294,13 +5294,22 @@ static bool corpus_at(void* at, u64 size) {
   return p == at;
 }
 
+#if defined(MADV_HUGEPAGE) && !defined(__EMSCRIPTEN__)
+#define corpus_huge(p, n) madvise(p, n, MADV_HUGEPAGE)
+#else
+#define corpus_huge(p, n) ((void)0)
+#endif
+
 static void* corpus_map(u64 size) {
   for (u64 hint = W32 ? 0 : 1ull << 45; hint > size; hint /= 2) {
     if (corpus_at((void*)hint, size)) {
+      corpus_huge((void*)hint, size);
       return (void*)hint;
     }
   }
-  return pool_mmap(size);
+  void* p = pool_mmap(size);
+  corpus_huge(p, size);
+  return p;
 }
 
 static void corpus_lay(u64* H, u64 size) {
@@ -5329,6 +5338,7 @@ static bool corpus_grow(u64* H, u64 need) {
     ok = !io_gpu && !W32 && more < 1ull << 43
       && corpus_at((char*)H + more, more);
     if (ok) {
+      corpus_huge((char*)H + more, more);
       corpus_lay(H, more * 2);
     }
   }
