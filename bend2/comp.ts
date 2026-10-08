@@ -5215,6 +5215,12 @@ static void cube_run(u64* H, bool gpu) {
 
 static u64 corpus_size;
 
+#if defined(MADV_HUGEPAGE) && !defined(__EMSCRIPTEN__)
+#define corpus_huge(p, n) madvise(p, n, MADV_HUGEPAGE)
+#else
+#define corpus_huge(p, n) ((void)0)
+#endif
+
 static void* corpus_map(u64 size) {
   u64   hint = W32 ? 0 : 1ull << 45;
   void* p    = pool_try((void*)hint, size);
@@ -5228,6 +5234,7 @@ static void* corpus_map(u64 size) {
   if (p == MAP_FAILED) {
     err_fail("reservation failed");
   }
+  corpus_huge(p, size);
   return p;
 }
 
@@ -5259,6 +5266,7 @@ static bool corpus_grow(u64* H, u64 need) {
       : pool_try(at, more);
     ok = got == at;
     if (ok) {
+      corpus_huge(got, more);
       corpus_lay(H, more * 2);
     } else if (got != MAP_FAILED) {
       munmap(got, more);
