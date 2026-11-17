@@ -573,8 +573,10 @@ the caller's thread (no workers, no headers), its effects inline, in memory
 grown as it needs (a 1 GiB corpus, `EMCC_CFLAGS=-DBEND_CORPUS_MB=N` sizes
 it), for a host without threads such as a Cloudflare Worker, which
 passes its precompiled module through the factory's `instantiateWasm`; its
-`+RTS --threads` does nothing. Both take the command line, `+RTS` options
-included, as the factory's `arguments`. `bend guide` prints this text, `bend
+`+RTS --threads` does nothing. A recursion deeper than its stack (the threads
+split 512 MiB, 16 to 64 MiB each; 24 MiB with `--single-thread`; 2 GiB
+natively) stops with the memory fault error. Both take the command line,
+`+RTS` options included, as the factory's `arguments`. `bend guide` prints this text, `bend
 base` prints the Base library (`bend base Map` prints one name and everything
 under it), and `bend --help` lists the other commands.
 

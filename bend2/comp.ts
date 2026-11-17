@@ -3304,11 +3304,19 @@ using namespace metal;
     STK(wi) = e.mem[(A) + wi]; \
   } \
   WL_PUSHN(N);
+#ifdef __EMSCRIPTEN__
+#define WL_ROOM(N) \
+  if (sp + (N) >= stk_end) { \
+    err_post(e.mem, ERR_DEEP); \
+    return 0; \
+  }
+#else
 #define WL_ROOM(N) \
   if (DEVICE && sp + (N) * CUBE >= e.mem + STAT_OFF + CUBE) { \
     err_post(e.mem, ERR_DEEP); \
     return 0; \
   }
+#endif
 
 // Types
 // =====
@@ -3456,6 +3464,9 @@ static CUdeviceptr gpu_front;
 #endif
 static bool io_gpu;
 static DEV Term*  io_stk;
+#ifdef __EMSCRIPTEN__
+static _Thread_local Term* stk_end;
+#endif
 
 static const char* CLI_HELP =
   "usage: %s [+RTS options -RTS] [arguments]\n"
@@ -4746,6 +4757,17 @@ static void* pool_mmap(u64 bytes) {
   return p;
 }
 
+#ifdef __EMSCRIPTEN__
+// The threads split 512 MiB of stacks, beside the corpus in the 2 GiB memory.
+static Term* pool_stack(void) {
+  u64   len = SOLO ? 24ull << 20 : (512ull << 20) / pool_size;
+  len       = len < 16ull << 20 ? 16ull << 20 : len > 64ull << 20 ? 64ull << 20
+    : len;
+  Term* p   = pool_mmap(len);
+  stk_end   = p + len / sizeof(Term);
+  return p;
+}
+#else
 static Term* pool_stack(void) {
   u64   len = 1ull << (W32 ? 24 : 31);
   u64   alt = 4 * SIGSTKSZ;
@@ -4761,6 +4783,7 @@ static Term* pool_stack(void) {
   sigaction(SIGBUS, &sa, NULL);
   return (Term*)p;
 }
+#endif
 
 // A wait yields a while before it sleeps, so a short turn pays no wake.
 
