@@ -1181,6 +1181,8 @@ function file_new(book: Bend.Book, js: boolean) {
     holds: new Map<string, Lay>(),
     fids: new Set<Name>(),
     effs: new Map<string, [string, string]>(),
+    fast: new Set<Name>(),
+    spun: new Set<Name>(),
     hold: new Map<string, boolean>(),
   };
 }
@@ -2094,6 +2096,7 @@ function emit_open(k: Name): [Scope, Val[]] {
   return [{ ...sc, seg: seg_new(k, ret, vals), def: k }, vals];
 }
 
+// A def named by SPIN_FAST spins as its fast path, else as its body.
 function emit_native(sc: Scope, k: Name): string {
   const name = name_id("spin_", k);
   memo(FL.units, "spin " + k, (n) => unit_new(n, () => {
@@ -2107,9 +2110,25 @@ function emit_native(sc: Scope, k: Name): string {
     const text = body.join("\n");
     const q = text.length + 1 < SPIN_FAR ? "INLINE"
       : seg.spin && /\bf32_(?:unbox|rewrap)\(/.test(text) ? "FAR" : "DFAR";
-    const head = `${q} Term ${name}(Env e, THR Term* o${seg.ks.map((kd, i) =>
+    const sig = `(Env e, THR Term* o${seg.ks.map((kd, i) =>
       `, ${lay_c(kd)} r${i}` + (arr_q(kd) ? `, u64 q${i}` : "")).join("")})`;
-    FL.unit!.segs.push({ ...seg, head, lines: [head + " {", ...body] });
+    if (!FL.fast.has(k)) {
+      const head = `${q} Term ${name}${sig}`;
+      FL.unit!.segs.push({ ...seg, head, lines: [head + " {", ...body] });
+      return;
+    }
+    if ([...seg.ks, ...seg.ret.ks].includes("box")) {
+      die(`SPIN_FAST(${Bend.name_key(k)}) names a spin over boxes: a fast`
+        + " path takes and gives words only");
+    }
+    const fast = name_id("fast_", k), soft = name_id("body_", k);
+    const args = ["e", "o", ...seg.ks.map((_, i) => `r${i}`)].join(", ");
+    const head = `INLINE Term ${name}${sig}`;
+    FL.unit!.segs.push({ ...seg, head: ["#if !DEVICE",
+      `static Term ${fast}${sig};`, "#endif", `${q} Term ${soft}${sig};`,
+      head].join("\n"), lines: [`${q} Term ${soft}${sig} {`, ...body, "",
+      head + " {", "#if !DEVICE", `  if (${fast}(${args})) {`, "    return 1;",
+      "  }", "#endif", `  return ${soft}(${args});`, "}"] });
   }));
   return seg_ref(sc, name);
 }
@@ -2641,9 +2660,11 @@ function emit_chain(sc: Scope, arms: [string, () => void][]): void {
 
 // Hand-written C and JS name ids as CID(k) and FID(k): k in the source's
 // namespace, else as is. effect_src first splices C backslash-newlines, as
-// C does in comments, which end at a line break.
+// C does in comments, which end at a line break. C alone has SPIN_FAST(k),
+// the C fast path a def's spin tries first (it answers 1 with the results
+// in o, or 0 to run the def's body), and SPIN(k), that body as a function.
 
-const ID_WORDS = /\/\/.*|\/\*[^]*?\*\/|"(?:\\[^]|[^"\\\n])*"|'(?:\\[^]|[^'\\\n])*'|`(?:\\[^]|[^`\\])*`|(?<![$\u200c\u200d\p{ID_Continue}])([CF]ID)\(([\w./~-]+)\)/gu;
+const ID_WORDS = /\/\/.*|\/\*[^]*?\*\/|"(?:\\[^]|[^"\\\n])*"|'(?:\\[^]|[^'\\\n])*'|`(?:\\[^]|[^`\\])*`|(?<![$\u200c\u200d\p{ID_Continue}])([CF]ID|SPIN_FAST|SPIN)\(([\w./~:-]+)\)/gu;
 const ID_C = RegExp(ID_WORDS.source.replace(".", "[^\\r\\n]"), "gu");
 
 function c_ids(src: string, m = "", use?: (p: string, k: Name) => void): string {
@@ -2659,6 +2680,11 @@ function c_ids(src: string, m = "", use?: (p: string, k: Name) => void): string 
       return t;
     }
     if (q === undefined) die(`${p}(${k}) names no constructor or def`);
+    if (p.startsWith("SPIN")) {
+      return FL.js ? die(`${p}(${k}) names a C function, in a JS source`)
+        : name_id(p === "SPIN_FAST" ? "fast_"
+          : FL.fast.has(q) ? "body_" : "spin_", q);
+    }
     return FL.js ? JSON.stringify(p === "CID" && q in FL.book.ctrs
       ? js_tag(q) : q) : name_id(p + "_", q);
   });
@@ -2679,6 +2705,12 @@ function effect_src(k: Name, tld: Bend.Def & { i: string[] }): void {
     FL.effs.set(path, [m, src]);
     if (!FL.js) c_ids(src, m, (p, q) => {
       if (p === "CID" && q in FL.book.ctrs) src_add(FL.book.ctrs[q].f);
+      if (p.startsWith("SPIN")) {
+        if (!done_live(tld_of(q))) {
+          die(`${p}(${Bend.name_key(q)}) names no filled def`);
+        }
+        (p === "SPIN" ? FL.spun : FL.fast).add(q);
+      }
       if (p === "FID" && fun_runs(tld_of(q))) {
         src_add(q);
         FL.fids.add(q);
@@ -2794,6 +2826,15 @@ export function compile_book(book: Bend.Book): string {
   const dev = reach([...[...FL.bangs].map(seg_fid), ...wide ? clos : []]);
   const segs = all.filter((s) => !s.native && live.has(s.fid));
   const spins = all.filter((s) => s.native && live.has(s.fid));
+  for (const k of new Set([...FL.fast, ...FL.spun])) {
+    if (!spins.some((s) => s.def === k)) {
+      die(`SPIN_FAST/SPIN(${Bend.name_key(k)}) names a def with no live spin`);
+    }
+    if (FL.fast.has(k) && segs.some((s) => s.def === k)) {
+      die(`SPIN_FAST(${Bend.name_key(k)}) names a def that also runs as a`
+        + " segment, which skips the fast path");
+    }
+  }
   const tabs = c_header(segs, clos);
   // a spin may call one defined after it
   const img = [`CONSTV u64 STAT_IMG[] = { ${FL.img.join(", ") || 0} };`,

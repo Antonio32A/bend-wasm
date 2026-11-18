@@ -95,6 +95,33 @@ runtime owns `w` and `f`. The effect owns `w->data`:
 allocate it in the run function and free it in `pack`. In `bend2/effs/`,
 `file_read.c` is the pattern for `io_work` and `tcp_recv.c` for `io_wait_on`.
 
+## A C fast path for a flat def
+
+A flat def (one that compiles to a native loop, `spin_N` in the C; see
+SHADERS.md) can take a C fast path from an effect's `.c` file. Name it
+`SPIN_FAST(module:def)`, the def's key with its module path from the entry
+file's folder, and give it the spin's exact parameters: `Env e`, `Term* o`,
+then each word of the def's parameters (`u32` for a `U32`, a record's
+fields in order). It writes the result words to `o` and returns 1, or
+returns 0 to run the Bend body:
+
+```c
+static Term SPIN_FAST(f64/arith:add)(Env e, THR Term* o, u32 ah, u32 al,
+    u32 bh, u32 bl) {
+  return finite(ah) && finite(bh) && put(o, of(ah, al) + of(bh, bl));
+}
+```
+
+Every call of the def then tries the fast path first; `SPIN(module:def)`
+is the Bend body alone, so a check can compare the two. Only the C target
+reads them: the JS target, the checker and the proofs keep the Bend body,
+which stays the reference. The `.c` file is spliced only while its effect
+def is reachable from `main`. The build fails when the name is no filled
+def, when the def compiles to no live spin, when something also runs it as a
+segment (as a `FID(module:def)` does), or when a parameter or the result
+is not words (an array, a list); the compiler writes the fast path's
+prototype from the spin, so a parameter mismatch is a C error.
+
 ## The JS side
 
 The `.js` file is a plain script, run once in a closure of its own, that
