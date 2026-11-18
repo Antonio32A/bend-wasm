@@ -118,6 +118,8 @@ const WORDS: Record<string, Lay> = Object.setPrototypeOf(
 
 const WIDE = 247;
 
+const WASM_REGS = 6;
+
 const ERRS = ("|*|*|out of memory: run again with a bigger span, as in"
   + " +RTS --gpu 8GB|a function the device does not hold|a Nat past the"
   + " largest immediate 2^48-1|*|memory fault (machine stack overflow?)|an"
@@ -2725,7 +2727,10 @@ function effect_src(k: Name, tld: Bend.Def & { i: string[] }): void {
 // A segment may fork if one it reaches does; Clo~apply reaches every
 // closure. The device holds what bangs reach (every closure, if a bang may
 // take one). rp pads the host's twelfth slot, freeing rax for the tail call.
-// WL_LOAD is a ladder: clang is O(n^2) on a fallthrough switch.
+// WL_LOAD is a ladder: clang is O(n^2) on a fallthrough switch. V8 stores
+// every stack argument of a tail call, so WebAssembly passes the first
+// WASM_REGS registers and banks the rest per thread, named r# only in the
+// segments.
 
 function c_units(): Unit[] {
   for (const [k, tld] of [...done_defs().reverse(),
@@ -2755,7 +2760,8 @@ function c_units(): Unit[] {
   return [...FL.units.values()];
 }
 
-function c_header(segs: Seg[], clos: string[]): string {
+function c_header(segs: Seg[], clos: string[], wasm: boolean):
+  [string, string, string] {
   const arg = val_new([""], W64);
   const entries = [...segs, seg_new("IO~emit", BOX, [arg]),
     seg_new(CLO_APPLY, BOX, [arg, arg])];
@@ -2786,10 +2792,16 @@ function c_header(segs: Seg[], clos: string[]): string {
     .map((s) => s.params.length));
   const reg = (f: string, k = n) => [...Array(k).keys()].map((i) =>
     f.replaceAll("#", String(i))).join(" ");
-  const ws = reg("r#").split(" ");
-  if (n > 6) {
+  const win = wasm ? Math.min(n, WASM_REGS) : n;
+  const ws = reg("r#", win).split(" ");
+  if (!wasm && n > 6) {
     ws.splice(6, 0, "rp");
   }
+  const banked = reg("r#").split(" ").slice(win);
+  const bank = banked.length === 0 ? ["", ""] : [[
+    `static _Thread_local Term wl_bank[${banked.length}];`,
+    ...banked.map((r, i) => `#define ${r} (wl_bank[${i}])`)],
+  banked.map((r) => `#undef ${r}`)].map((ls) => ls.join("\n") + "\n\n");
   defs.push(`CONSTV Fid FID_T[] = { ${entries.map((s) => `{ ${[s.params.length,
     s.frame === null ? 0 : s.params.length - s.frame.at.length,
     FL.bangs.has(s.def), !forky.has(s.fid)].map(Number).join(", ")} }`)
@@ -2808,11 +2820,11 @@ function c_header(segs: Seg[], clos: string[]): string {
   `#define WL_TABLE ${entries.map((s) => `WL_X(${s.fid})`).join(" ")
     } WL_X(FID_EXIT)`, `#define MAIN_FID ${seg_fid("main")}`,
   `#define BLK_SHR ${Number(fact("type", "Array"))}`);
-  return [defs.join("\n"), ...[...FL.tabs].map(([r, i]) =>
-    `CONSTV u64 TAB_${i}[] = { ${r} };`)].join("\n\n");
+  return [[defs.join("\n"), ...[...FL.tabs].map(([r, i]) =>
+    `CONSTV u64 TAB_${i}[] = { ${r} };`)].join("\n\n"), bank[0], bank[1]];
 }
 
-export function compile_book(book: Bend.Book): string {
+export function compile_book(book: Bend.Book, wasm = false): string {
   FL = file_new(main_pure(book), false);
   file_book(["main", ...RUNTIME_ADTS]);
   const us = c_units();
@@ -2835,7 +2847,7 @@ export function compile_book(book: Bend.Book): string {
         + " segment, which skips the fast path");
     }
   }
-  const tabs = c_header(segs, clos);
+  const [tabs, bank, unbank] = c_header(segs, clos, wasm);
   // a spin may call one defined after it
   const img = [`CONSTV u64 STAT_IMG[] = { ${FL.img.join(", ") || 0} };`,
     spins.map((s) => s.head + ";").join("\n"),
@@ -2849,8 +2861,8 @@ export function compile_book(book: Bend.Book): string {
   }).join("\n\n");
   const reqs = [...FL.effs.values()].map(([m, src]) => c_ids(src, m)).join("");
   // emitted C names no ids, so only the runtime is scanned
-  const raw = c_ids(runtime_c("\0", "\0", "\0", "\0")).split("\0");
-  const c = String.raw({ raw }, tabs, img, text, reqs);
+  const raw = c_ids(runtime_c("\0", "\0", "\0", "\0", "\0")).split("\0");
+  const c = String.raw({ raw }, tabs, img, bank + text, unbank, reqs);
   // keep nothing memoized: clang may run next while this process waits
   FL = file_new(book, false);
   return c;
@@ -3178,7 +3190,7 @@ function a32_ops(f: (k: string) => string): string {
 }
 
 const runtime_c = (tabs: string, spins: string, segs: string,
-  reqs: string) => String.raw`
+  unbank: string, reqs: string) => String.raw`
 
 // Imports
 // =======
@@ -4516,7 +4528,7 @@ ${segs}
 }
 #endif
 
-// Monk
+${unbank}// Monk
 // ====
 
 // One turn on a ring: its head task below put0 runs (a growing lane skips a

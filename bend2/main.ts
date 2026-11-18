@@ -434,7 +434,7 @@ function cli_emit(book: Bend.Book, out: string, single: boolean): void {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bend-"));
     try {
       const c = path.join(dir, path.basename(out) + ".c");
-      fs.writeFileSync(c, Comp.compile_book(book));
+      fs.writeFileSync(c, Comp.compile_book(book, out.endsWith(".wasm")));
       Bun.gc(true);
       if (out.endsWith(".wasm")) {
         cli_build_wasm(out, c, single);
