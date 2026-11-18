@@ -3811,9 +3811,10 @@ INLINE void bank_push(DEV u64* H, u32 c, u64 head) {
 // ====
 
 // Lanes keep a free chain and word count per class. Host chains reaching
-// KEEP_WORDS replace COLD and bank old COLD; blocks >= CAP_WORDS >=
-// KEEP_WORDS go straight to the bank. A miss takes COLD, the bank or fresh
-// memory. Devices bank at dev_cut.
+// KEEP_WORDS replace COLD and put old COLD in the free map (classes under
+// NCLS) or the bank; blocks >= CAP_WORDS >= KEEP_WORDS go straight to the
+// bank. A miss takes COLD, the free map, the bank or fresh memory. Devices
+// bank at dev_cut.
 
 #define ALC_AT(e, i)   (e).alc[(i) * LANE_STEP]
 #define ALC_LEN(e, c)  ALC_AT(e, NCLS_ALL + (c))
@@ -3824,10 +3825,110 @@ INLINE u32 cls_fit(u32 words) {
   return words > 1 ? 32 - clz(words - 1) : 0;
 }
 
+// The free map holds a bit per free cell of each class under NCLS, and its
+// top a bit per map word that may be non-zero. A take claims whole words from
+// the lowest hint up, so recycled cells come back in address order. CPU hosts
+// but SOLO map it; without it, the bank serves.
+
+#if DEVICE || SOLO
+
+#define free_map_put(H, c, chain) false
+#define free_map_take(H, c, n)    0ull
+
+#else
+
+#define FREE_MAP_FILL 4096
+#define FREE_MAP_SCAN 65536
+
+_Static_assert(HEAP_OFF % PAGE_LEN == 0, "the heap starts on a page");
+
+static _Atomic u64*    free_map[NCLS];
+static _Atomic u64*    free_map_top[NCLS];
+static u64             free_map_len[NCLS];
+static _Atomic u64     free_map_low[NCLS];
+static _Atomic int64_t free_map_cells[NCLS];
+
+static bool free_map_put(u64* H, u32 cls, u64 chain) {
+  if (cls >= NCLS || free_map[cls] == NULL) {
+    return false;
+  }
+  _Atomic u64* map = free_map[cls];
+  _Atomic u64* top = free_map_top[cls];
+  u64     low = ~0ull;
+  int64_t n   = 0;
+  for (u64 c = chain, next; c != 0; c = next, n += 1) {
+    next    = H[c];
+    u64 i   = (c - HEAP_OFF) >> cls;
+    u64 w   = i / 64;
+#ifdef BEND_POISON
+    if (c < HEAP_OFF || (c - HEAP_OFF) % (1ull << cls) != 0
+      || w >= free_map_len[cls]) {
+      err_fail("a free cell outside its class's map");
+    }
+#endif
+    u64 was = atomic_fetch_or_explicit(&map[w], 1ull << (i % 64), REL);
+#ifdef BEND_POISON
+    if (was & 1ull << (i % 64)) {
+      err_fail("a cell freed twice");
+    }
+#endif
+    if (was == 0) {
+      atomic_fetch_or_explicit(&top[w / 64], 1ull << (w % 64), REL);
+    }
+    low = w / 64 < low ? w / 64 : low;
+  }
+  atomic_fetch_min_explicit(&free_map_low[cls], low, RLX);
+  atomic_fetch_add_explicit(&free_map_cells[cls], n, RLX);
+  return true;
+}
+
+static u64 free_map_take(u64* H, u32 cls, u32* cells) {
+  int64_t have = cls < NCLS
+    ? atomic_load_explicit(&free_map_cells[cls], RLX) : 0;
+  if (have <= 0) {
+    return 0;
+  }
+  _Atomic u64* map  = free_map[cls];
+  _Atomic u64* top  = free_map_top[cls];
+  u64  used = ((u64)a32_load(a32_at(H, H_BUMP)) << PAGE_BITS >> cls) / 4096 + 1;
+  u64  tops = (free_map_len[cls] + 63) / 64;
+  u64  end  = used < tops ? used : tops;
+  u64  from = atomic_load_explicit(&free_map_low[cls], RLX);
+  u64  want = (u64)have < FREE_MAP_FILL >> cls ? (u64)have
+    : FREE_MAP_FILL >> cls;
+  u64  t    = from < end ? from : 0;
+  u64  head = 0;
+  u64* tail = &head;
+  u32  n    = 0;
+  for (u64 seen = 0; seen < end && seen < FREE_MAP_SCAN && n < want;
+    seen += 1) {
+    u64 ws = atomic_load_explicit(&top[t], RLX);
+    for (; ws != 0 && n < want; ws &= ws - 1) {
+      u64 w = t * 64 + __builtin_ctzll(ws);
+      atomic_fetch_and_explicit(&top[t], ~(1ull << (w % 64)), ACQ);
+      u64 bits = atomic_exchange_explicit(&map[w], 0, ACQ);
+      for (; bits != 0; bits &= bits - 1, n += 1) {
+        u64 loc = HEAP_OFF + ((w * 64 + __builtin_ctzll(bits)) << cls);
+        *tail   = loc;
+        tail    = &H[loc];
+      }
+    }
+    t = ws != 0 ? t : t + 1 < end ? t + 1 : 0;
+  }
+  *tail = 0;
+  atomic_compare_exchange_strong_explicit(&free_map_low[cls], &from, t,
+    RLX, RLX);
+  atomic_fetch_sub_explicit(&free_map_cells[cls], n, RLX);
+  *cells = n;
+  return head;
+}
+
+#endif
+
 OUTLINE void heap_hand(Env e, u32 cls) {
   bool large = (1ull << cls) >= CAP_WORDS;
   u64 cold = large ? ALC_AT(e, cls) : ALC_COLD(e, cls);
-  if (cold) {
+  if (cold && !free_map_put(e.mem, cls, cold)) {
     bank_push(e.mem, cls, cold);
   }
   ALC_COLD(e, cls) = large ? 0 : ALC_AT(e, cls);
@@ -3843,14 +3944,18 @@ static bool corpus_grow(u64* H, u64 need);
 OUTLINE u64 heap_alloc_miss(Env e, u32 cls) {
   DEV u64* H = e.mem;
   u64  got = 0;
+  u32  n   = 0;
   if (!DEVICE) {
     got = ALC_COLD(e, cls);
     ALC_COLD(e, cls) = 0;
   }
   if (!got) {
+    got = free_map_take(H, cls, &n);
+  }
+  if (!got) {
     got = bank_pop(H, cls);
   }
-  u32 n = got ? KEEP(cls) : cls < NCLS ? QUANTUM >> cls : 1;
+  n = n != 0 ? n : got ? KEEP(cls) : cls < NCLS ? QUANTUM >> cls : 1;
   if (!got) {
     u32 pages = (n << cls) >> PAGE_BITS;
     u32 p     = a32_add(a32_at(H, H_BUMP), pages);
@@ -5426,6 +5531,28 @@ static bool corpus_grow(u64* H, u64 need) {
 #define BEND_CORPUS_MB (1ull << (W32 ? 10 : 13))
 #endif
 
+#if SOLO
+#define free_map_lay(pages) ((void)0)
+#else
+static void free_map_lay(u64 pages) {
+  u64 len[NCLS], words = 0;
+  for (u32 c = 0; c < NCLS; c += 1) {
+    len[c]  = ((pages << PAGE_BITS >> c) + 63) / 64;
+    words  += len[c] + (len[c] + 63) / 64;
+  }
+  _Atomic u64* at = pool_try(NULL, words * sizeof(u64));
+  if ((void*)at == MAP_FAILED) {
+    return;
+  }
+  for (u32 c = 0; c < NCLS; c += 1) {
+    free_map[c]     = at;
+    free_map_top[c] = at + len[c];
+    free_map_len[c] = len[c];
+    at             += len[c] + (len[c] + 63) / 64;
+  }
+}
+#endif
+
 static u64* corpus_setup(bool gpu, long threads, u64 bytes) {
   io_gpu     = gpu;
   KEEP_WORDS = gpu ? CHUNK : CAP_WORDS;
@@ -5438,6 +5565,8 @@ static u64* corpus_setup(bool gpu, long threads, u64 bytes) {
   a32_store(a32_at(H, H_BUMP), 1);
   if (gpu) {
     gpu_load(size);
+  } else {
+    free_map_lay(W32 ? a32_load(a32_at(H, H_CAP)) : ~0u);
   }
 #if SOLO
   pool_size = 1;
